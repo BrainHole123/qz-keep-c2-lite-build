@@ -1,0 +1,734 @@
+diff --git a/src/devices/bluetooth.cpp b/src/devices/bluetooth.cpp
+index e59ee95..c118846 100644
+--- a/src/devices/bluetooth.cpp
++++ b/src/devices/bluetooth.cpp
+@@ -3301,7 +3301,8 @@ void bluetooth::deviceDiscovered(const QBluetoothDeviceInfo &device) {
+                 ultraSportBike->deviceDiscovered(b);
+                 this->signalBluetoothDeviceConnected(ultraSportBike);
+             } else if ((b.name().toUpper().startsWith(QStringLiteral("KEEP_BIKE_")) ||
+-                        b.name().toUpper().startsWith(QStringLiteral("KEEP_CC_"))) && !keepBike && filter) {
++                        b.name().toUpper().startsWith(QStringLiteral("KEEP_CC_")) ||
++                        keepbike::isC2LiteName(b.name())) && !keepBike && filter) {
+                 this->setLastBluetoothDevice(b);
+                 this->stopDiscovery();
+                 keepBike = new keepbike(noWriteResistance, noHeartService, bikeResistanceOffset, bikeResistanceGain);
+diff --git a/src/devices/keepbike/keep_protocol.cpp b/src/devices/keepbike/keep_protocol.cpp
+new file mode 100644
+index 0000000..6da1529
+--- /dev/null
++++ b/src/devices/keepbike/keep_protocol.cpp
+@@ -0,0 +1,193 @@
++// SPDX-License-Identifier: GPL-3.0-only
++#include "keep_protocol.h"
++
++#include <algorithm>
++#include <cstring>
++
++namespace keep {
++namespace {
++
++constexpr uint8_t MetricsMarker[]{0xb5, '1', '0', '6', '/', '7', 0xff};
++
++bool readVarint(const uint8_t *&cursor, const uint8_t *end, uint64_t &value) {
++    value = 0;
++    for (unsigned shift = 0; shift <= 63 && cursor != end; shift += 7) {
++        uint8_t byte = *cursor++;
++        if (shift == 63 && byte > 1) {
++            return false;
++        }
++        value |= uint64_t(byte & 0x7f) << shift;
++        if (byte < 0x80) {
++            return true;
++        }
++    }
++    return false;
++}
++
++size_t finishFrame(Frame &frame, uint8_t seq, size_t bodySize) {
++    frame[0] = 0xa5;
++    frame[1] = 0xa5;
++    frame[2] = 0xa0;
++    frame[3] = seq;
++    put16(frame.data() + 4, bodySize);
++    const size_t crcOffset = bodySize + 6;
++    put16(frame.data() + crcOffset, crc16(frame.data(), crcOffset));
++    return crcOffset + 2;
++}
++
++} // namespace
++
++uint16_t crc16(const uint8_t *bytes, size_t size) {
++    uint16_t crc = 0;
++    for (size_t i = 0; i < size; ++i) {
++        crc ^= uint16_t(bytes[i]) << 8;
++        for (unsigned bit = 0; bit < 8; ++bit) {
++            const uint16_t polynomial = (crc & 0x8000) ? 0x1021 : 0;
++            crc = (crc << 1) ^ polynomial;
++        }
++    }
++    return crc;
++}
++
++size_t heartbeat(Frame &frame, Profile profile, uint8_t sequence, uint16_t counter, const Ride &ride) {
++    const uint8_t body[]{0x32, 0x16, 0xef, 0x23, 0x55, 0x01, 0x93, 0, 0,
++                         0x04, 0, 0, 0x01, 0xb5, '1', '0', '6', '/', '7'};
++    std::memcpy(frame.data() + 6, body, sizeof(body));
++    put16(frame.data() + 13, counter);
++    size_t end = 6 + sizeof(body);
++    if (profile == Profile::BikeCon && ride.status == 3) {
++        frame[end++] = 0xff;
++        frame[end++] = 0x20;
++        uint64_t value = uint64_t(ride.calories) * 1000;
++        while (value >= 128) {
++            frame[end++] = uint8_t(value & 0x7f) | 0x80;
++            value >>= 7;
++        }
++        frame[end++] = uint8_t(value);
++    }
++    return finishFrame(frame, sequence, end - 6);
++}
++
++size_t startRide(Frame &frame, Profile profile, uint8_t sequence, uint8_t counter) {
++    // BikeCon pre-increments its counter. Bike-FTMS-Bridge starts at 0x06.
++    const uint8_t value = counter + (profile == Profile::BikeCon);
++    const uint8_t body[]{0x32, 0x16, 0xef, 0x23, 0x55, 0x03, 0xb0, value,
++                         uint8_t(value + 9), 0x04, 0, 0, 0x02, 0xb5,
++                         '1', '0', '6', '/', '4', 0xff, 0x08, 0x03};
++    std::memcpy(frame.data() + 6, body, sizeof(body));
++    return finishFrame(frame, sequence, sizeof(body));
++}
++
++bool decodeRide(const uint8_t *payload, size_t size, Ride &ride) {
++    const uint8_t *end = payload + size;
++    const uint8_t *marker = std::search(payload, end, std::begin(MetricsMarker), std::end(MetricsMarker));
++    if (marker == end) {
++        return false;
++    }
++    const uint8_t *cursor = marker + sizeof(MetricsMarker);
++    Ride result{};
++    bool hasMetrics = false;
++    while (cursor < end) {
++        uint64_t key = 0;
++        uint64_t value = 0;
++        if (!readVarint(cursor, end, key) || key < 8 || key > UINT32_MAX) {
++            return false;
++        }
++        const uint32_t field = key >> 3;
++        const unsigned wireType = key & 7;
++        switch (wireType) {
++        case 0:
++            if (!readVarint(cursor, end, value)) {
++                return false;
++            }
++            break;
++        case 2: {
++            uint64_t length = 0;
++            if (!readVarint(cursor, end, length) || length > uint64_t(end - cursor)) {
++                return false;
++            }
++            // Both reference clients also accept a little-endian byte value.
++            if (field >= 2 && field <= 8) {
++                if (length == 0 || length > 4) {
++                    return false;
++                }
++                for (unsigned i = 0; i < length; ++i) {
++                    value |= uint64_t(cursor[i]) << (8 * i);
++                }
++            }
++            cursor += length;
++            break;
++        }
++        case 1:
++        case 5: {
++            const ptrdiff_t length = wireType == 1 ? 8 : 4;
++            if (end - cursor < length) {
++                return false;
++            }
++            cursor += length;
++            continue;
++        }
++        default:
++            return false;
++        }
++        if (field >= 2 && field <= 8 && value > UINT32_MAX) {
++            return false;
++        }
++        switch (field) {
++        case 2: result.distance = value; result.hasDistance = true; break;
++        case 3: result.seconds = value; result.hasSeconds = true; break;
++        case 4: result.calories = value; break;
++        case 5: result.resistance = value; break;
++        case 6: result.cadence = value; hasMetrics = true; break;
++        case 7: result.power = value; hasMetrics = true; break;
++        case 8: result.status = value; result.hasStatus = true; break;
++        default: break;
++        }
++    }
++    if (!hasMetrics && !result.hasStatus && !(result.hasSeconds && result.hasDistance)) {
++        return false;
++    }
++    ride = result;
++    return true;
++}
++
++void Receiver::discard(size_t size) {
++    used -= size;
++    std::memmove(buffer.data(), buffer.data() + size, used);
++}
++
++bool Receiver::push(uint8_t byte, Ride &ride) {
++    buffer[used++] = byte;
++    while (used >= 2) {
++        if (buffer[0] != 0xa5 || buffer[1] != 0xa5) {
++            discard(1);
++            continue;
++        }
++        if (used < 6) {
++            break;
++        }
++        const size_t payloadSize = le16(buffer.data() + 4);
++        const size_t frameSize = payloadSize + 8;
++        if (frameSize > buffer.size()) {
++            ++badFrames;
++            discard(1);
++            continue;
++        }
++        if (used < frameSize) {
++            break;
++        }
++        if (crc16(buffer.data(), frameSize - 2) != le16(buffer.data() + frameSize - 2)) {
++            ++badFrames;
++            discard(1);
++            continue;
++        }
++        const bool decoded = decodeRide(buffer.data() + 6, payloadSize, ride);
++        discard(frameSize);
++        if (decoded) {
++            return true;
++        }
++    }
++    return false;
++}
++
++} // namespace keep
+diff --git a/src/devices/keepbike/keep_protocol.h b/src/devices/keepbike/keep_protocol.h
+new file mode 100644
+index 0000000..cad0e9a
+--- /dev/null
++++ b/src/devices/keepbike/keep_protocol.h
+@@ -0,0 +1,54 @@
++// SPDX-License-Identifier: GPL-3.0-only
++#pragma once
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++
++namespace keep {
++
++constexpr size_t MaxFrame = 512;
++using Frame = std::array<uint8_t, MaxFrame>;
++
++enum class Profile { Bridge, BikeCon };
++
++struct Ride {
++    uint32_t distance = 0;
++    uint32_t seconds = 0;
++    uint32_t calories = 0;
++    uint32_t resistance = 0;
++    uint32_t cadence = 0;
++    uint32_t power = 0;
++    uint32_t status = 0;
++    bool hasDistance = false;
++    bool hasSeconds = false;
++    bool hasStatus = false;
++};
++
++inline uint16_t le16(const uint8_t *bytes) {
++    return bytes[0] | (uint16_t(bytes[1]) << 8);
++}
++
++inline void put16(uint8_t *bytes, uint16_t value) {
++    bytes[0] = value & 0xff;
++    bytes[1] = value >> 8;
++}
++
++uint16_t crc16(const uint8_t *bytes, size_t size);
++size_t heartbeat(Frame &frame, Profile profile, uint8_t sequence, uint16_t counter, const Ride &ride);
++size_t startRide(Frame &frame, Profile profile, uint8_t sequence, uint8_t counter);
++bool decodeRide(const uint8_t *payload, size_t size, Ride &ride);
++
++class Receiver {
++public:
++    void clear() { used = 0; }
++    bool push(uint8_t byte, Ride &ride);
++    unsigned badFrames = 0;
++
++private:
++    void discard(size_t size);
++    Frame buffer{};
++    size_t used = 0;
++};
++
++} // namespace keep
+diff --git a/src/devices/keepbike/keepbike.cpp b/src/devices/keepbike/keepbike.cpp
+index 2464b62..56d75a3 100644
+--- a/src/devices/keepbike/keepbike.cpp
++++ b/src/devices/keepbike/keepbike.cpp
+@@ -3,6 +3,11 @@
+ #include <QBluetoothLocalDevice>
+ #include <QDateTime>
+ #include <QFile>
++#include <QJsonArray>
++#include <QJsonDocument>
++#include <QJsonObject>
++#include <QPointer>
++#include <QStandardPaths>
+ #include <QMetaEnum>
+ #include <QSettings>
+ #include <chrono>
+@@ -56,6 +61,10 @@ uint8_t newProtocolMessageType(const QByteArray &payload) {
+ extern quint8 QZ_EnableDiscoveryCharsAndDescripttors;
+ #endif
+ 
++bool keepbike::isC2LiteName(const QString &name) {
++    return name.startsWith(QStringLiteral("KEEP_C2_LITE_"), Qt::CaseInsensitive);
++}
++
+ uint16_t keepbike::newProtocolCrc(const QByteArray &packet) {
+     uint16_t crc = 0;
+     for (const char rawByte : packet) {
+@@ -334,11 +343,27 @@ void keepbike::forceResistance(resistance_t requestResistance) {
+ 
+ void keepbike::update() {
+ 
++    if (!m_control) {
++        return;
++    }
+     if (m_control->state() == QLowEnergyController::UnconnectedState) {
+         emit disconnected();
+         return;
+     }
+ 
++    if (c2Lite) {
++        if (initRequest) {
++            initRequest = false;
++            initC2Lite();
++        }
++        if (initDone && m_control->state() == QLowEnergyController::DiscoveredState &&
++            gattCommunicationChannelService &&
++            gattCommunicationChannelService->state() == QLowEnergyService::ServiceDiscovered) {
++            updateC2Lite();
++        }
++        return;
++    }
++
+     if (initRequest) {
+         initRequest = false;
+         btinit();
+@@ -416,7 +441,12 @@ double keepbike::bikeResistanceToPeloton(double resistance) {
+ void keepbike::characteristicChanged(const QLowEnergyCharacteristic &characteristic, const QByteArray &newValue) {
+     QDateTime now = QDateTime::currentDateTime();
+     // qDebug() << "characteristicChanged" << characteristic.uuid() << newValue << newValue.length();
+-    Q_UNUSED(characteristic);
++    if (c2Lite) {
++        if (characteristic == gattNotifyCharacteristic && initDone) {
++            readC2Lite(newValue);
++        }
++        return;
++    }
+ 
+     if (isNewProtocolFrame(newValue)) {
+         newProtocol = true;
+@@ -623,6 +653,228 @@ double keepbike::GetSpeedFromPacket(const QByteArray &packet) {
+     return data;
+ }
+ 
++void keepbike::initC2Lite() {
++    const QString path = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) +
++                         QStringLiteral("/keep-c2-lite.json");
++    QFile file(path);
++    QJsonObject identity;
++    if (file.exists()) {
++        if (!file.open(QIODevice::ReadOnly)) {
++            qDebug().noquote() << QStringLiteral("Keep C2 Lite: cannot read optional identity file");
++            return;
++        }
++        identity = QJsonDocument::fromJson(file.read(16385)).object();
++    } else {
++        // Same upstream QZ payloads tested against C2 Lite firmware 1.0.4.
++        // A personal Keep App capture was not needed on that bicycle.
++        newProtocolSession = static_cast<quint32>(QDateTime::currentMSecsSinceEpoch() & 0xffffffff);
++        QJsonArray packets;
++        const QList<QByteArray> payloads{
++            QByteArray::fromHex("01b3312f31ff6134633664323438353566623930376300"),
++            QByteArray::fromHex("046100553130362f33ff0a18353966393532633231636633643130393064366138376333121066643265353031653665356464363230"),
++            QByteArray::fromHex("046100553130362f36"),
++            QByteArray::fromHex("046100553130362f34")};
++        uint16_t sequence = 0x00a0;
++        for (const auto &payload : payloads) {
++            packets.append(QString::fromLatin1(buildNewProtocolFrame(sequence, newProtocolSession, payload).toHex()));
++            sequence += 0x0100;
++        }
++        identity.insert(QStringLiteral("profile"), QStringLiteral("QZ"));
++        identity.insert(QStringLiteral("handshake_packets"), packets);
++    }
++    const QString bikeName = identity.value(QStringLiteral("bike_name")).toString();
++    if (!bikeName.isEmpty() && bikeName != QStringLiteral("Unknown") &&
++        bikeName.compare(bluetoothDevice.name(), Qt::CaseInsensitive) != 0) {
++        qDebug().noquote() << QStringLiteral("Keep C2 Lite: identity bike_name differs from selected device");
++        return;
++    }
++    const QString profile = identity.value(QStringLiteral("profile")).toString(QStringLiteral("Bridge"));
++    if (profile != QStringLiteral("Bridge") && profile != QStringLiteral("BikeCon") && profile != QStringLiteral("QZ")) {
++        qDebug().noquote() << QStringLiteral("Keep C2 Lite: profile must be QZ, Bridge or BikeCon");
++        return;
++    }
++
++    const auto packets = identity.value(QStringLiteral("handshake_packets")).toArray();
++    if (packets.isEmpty() || packets.size() > 4) {
++        qDebug().noquote() << QStringLiteral("Keep C2 Lite: expected 1–4 captured handshake frames");
++        return;
++    }
++    QList<QByteArray> validated;
++    int previousSequence = -1;
++    for (const auto &packet : packets) {
++        const auto value = packet.toString();
++        bool validHex = !value.isEmpty() && value.size() % 2 == 0;
++        for (const QChar character : value) {
++            const ushort code = character.unicode();
++            if (!((code >= '0' && code <= '9') || (code >= 'a' && code <= 'f') ||
++                  (code >= 'A' && code <= 'F'))) validHex = false;
++        }
++        if (value.size() > int(keep::MaxFrame * 2) || !validHex) {
++            qDebug().noquote() << QStringLiteral("Keep C2 Lite: invalid handshake hex");
++            return;
++        }
++        const auto frame = QByteArray::fromHex(value.toLatin1());
++        if (!frame.startsWith(QByteArray::fromHex("a5a5a0")) || !isNewProtocolFrame(frame) ||
++            uint8_t(frame.at(3)) > 3 || uint8_t(frame.at(3)) <= previousSequence) {
++            qDebug().noquote() << QStringLiteral("Keep C2 Lite: invalid handshake frame length, CRC or sequence");
++            return;
++        }
++        previousSequence = uint8_t(frame.at(3));
++        validated.append(frame);
++    }
++
++    c2UseQzProtocol = profile == QStringLiteral("QZ");
++    if (c2UseQzProtocol) {
++        if (validated.size() != 4 || previousSequence != 3 || validated.first().size() < 18) return;
++        const auto &first = validated.first();
++        newProtocolSession = 0;
++        for (unsigned i = 0; i < 4; ++i) newProtocolSession |= quint32(uint8_t(first.at(12 + i))) << (8 * i);
++    }
++    ++c2WriteGeneration;
++    c2Profile = profile == QStringLiteral("BikeCon") ? keep::Profile::BikeCon : keep::Profile::Bridge;
++    c2Handshake = validated;
++    c2Receiver = keep::Receiver{};
++    c2Notifies = 0;
++    c2HasData = false;
++    c2Sequence = c2Profile == keep::Profile::Bridge ? 4 : 0;
++    c2Counter = c2Profile == keep::Profile::Bridge ? 0x1104 : 0xa400;
++    c2StartCounter = 6;
++    c2Clock.start();
++    c2NextSend = 0;
++    c2LastRx = 0;
++    resetC2LiteMetrics();
++    initDone = true;
++    qDebug().noquote() << QStringLiteral("Keep C2 Lite: replaying %1 handshake frames (%2)")
++                   .arg(c2Handshake.size()).arg(profile);
++}
++
++void keepbike::writeC2Lite(const QByteArray &frame) {
++    const auto properties = gattWriteCharacteristic.properties();
++    const bool canWrite = properties.testFlag(QLowEnergyCharacteristic::Write);
++    const bool noResponse = properties.testFlag(QLowEnergyCharacteristic::WriteNoResponse);
++    const quint64 generation = ++c2WriteGeneration;
++    // On this 1.0.4 bicycle a 43-byte write succeeded, while the 74-byte
++    // auth write returned ATT 0x0d. 20-byte Write Commands delivered it.
++    // 43 is a conservative observed bound, not a claimed negotiated MTU.
++    if (canWrite && (!noResponse || (frame.size() <= 43 && c2Profile == keep::Profile::Bridge))) {
++        gattCommunicationChannelService->writeCharacteristic(
++            gattWriteCharacteristic, frame, QLowEnergyService::WriteWithResponse);
++        return;
++    }
++    const QPointer<QLowEnergyService> service(gattCommunicationChannelService);
++    for (int offset = 0; offset < frame.size(); offset += 20) {
++        const QByteArray chunk = frame.mid(offset, 20);
++        QTimer::singleShot((offset / 20) * 10, this, [this, service, generation, chunk]() {
++            if (!initDone || generation != c2WriteGeneration || !service ||
++                service->state() != QLowEnergyService::ServiceDiscovered) return;
++            service->writeCharacteristic(gattWriteCharacteristic, chunk, QLowEnergyService::WriteWithoutResponse);
++        });
++    }
++    c2NextSend = qMax(c2NextSend, c2Clock.elapsed() + ((frame.size() + 19) / 20) * 10 + 100);
++}
++
++void keepbike::updateC2Lite() {
++    const qint64 now = c2Clock.elapsed();
++    if (now - c2LastRx >= 20000) {
++        qDebug().noquote() << QStringLiteral("Keep C2 Lite: telemetry timeout, FF01 notifications=%1, CRC/length errors=%2")
++                       .arg(c2Notifies).arg(c2Receiver.badFrames);
++        initDone = false;
++        resetC2LiteMetrics();
++        m_control->disconnectFromDevice();
++        return;
++    }
++    if (now - c2LastRx >= 4000) {
++        resetC2LiteMetrics();
++    }
++    update_metrics(false, watts());
++    requestResistance = -1;
++    requestStop = -1;
++    if (now < c2NextSend) {
++        return;
++    }
++
++    if (!c2Handshake.isEmpty()) {
++        writeC2Lite(c2Handshake.takeFirst());
++        c2NextSend = qMax(c2NextSend, now + 300);
++        return;
++    }
++
++    keep::Frame frame{};
++    if (requestStart != -1) {
++        requestStart = -1;
++        // Avoid issuing a second Start if the user already started on the bike.
++        if (c2LastRide.status != 3) {
++            const size_t size = keep::startRide(frame, c2Profile, c2Sequence++, c2StartCounter++);
++            writeC2Lite(QByteArray(reinterpret_cast<const char *>(frame.data()), int(size)));
++            qDebug().noquote() << QStringLiteral("Keep C2 Lite: sent Start");
++        }
++        emit bikeStarted();
++        c2NextSend = qMax(c2NextSend, now + 300);
++        return;
++    }
++
++    if (c2UseQzProtocol) {
++        writeC2Lite(buildNewProtocolFrame(uint16_t(0x00a0 | (uint16_t(c2Sequence++) << 8)),
++                                         newProtocolSession, QByteArray::fromHex("01b53130362f37")));
++    } else {
++        const size_t size = keep::heartbeat(frame, c2Profile, c2Sequence++, c2Counter, c2LastRide);
++        writeC2Lite(QByteArray(reinterpret_cast<const char *>(frame.data()), int(size)));
++    }
++    c2Counter += c2Profile == keep::Profile::Bridge ? 1 : 257;
++    c2NextSend = now + 1000;
++}
++
++void keepbike::readC2Lite(const QByteArray &bytes) {
++    ++c2Notifies;
++    for (const char byte : bytes) {
++        keep::Ride ride;
++        if (!c2Receiver.push(uint8_t(byte), ride)) {
++            continue;
++        }
++
++        if (!ride.hasStatus) {
++            ride.status = c2LastRide.status;
++        }
++        const bool active = ride.status != 1 && ride.status != 2 && ride.status != 4;
++        QSettings settings;
++        if (settings.value(QZSettings::cadence_sensor_name, QZSettings::default_cadence_sensor_name)
++                .toString().startsWith(QStringLiteral("Disabled"))) {
++            Cadence = active ? qMin<uint32_t>(ride.cadence, 32767) : 0;
++        }
++        m_watt = active ? qMin<uint32_t>(ride.power, 32766) : 0;
++
++        if (!active) {
++            Speed = 0;
++        } else if (ride.hasDistance && c2LastRide.hasDistance && ride.hasSeconds && c2LastRide.hasSeconds) {
++            if (ride.seconds > c2LastRide.seconds && ride.distance >= c2LastRide.distance) {
++                Speed = 3.6 * (ride.distance - c2LastRide.distance) / (ride.seconds - c2LastRide.seconds);
++            } else if (ride.seconds < c2LastRide.seconds || ride.distance < c2LastRide.distance) {
++                Speed = 0;
++            }
++        }
++        if (ride.resistance > 0 && ride.resistance <= max_resistance) {
++            Resistance = ride.resistance;
++            emit resistanceRead(Resistance.value());
++            m_pelotonResistance = bikeResistanceToPeloton(Resistance.value());
++        }
++
++        if (!c2HasData || ride.status != c2LastRide.status) {
++            qDebug().noquote() << QStringLiteral("Keep C2 Lite: telemetry state=%1, cadence=%2 rpm, power=%3 W")
++                           .arg(ride.status).arg(ride.cadence).arg(ride.power);
++        }
++        c2LastRide = ride;
++        c2LastRx = c2Clock.elapsed();
++        c2HasData = true;
++    }
++}
++
++void keepbike::resetC2LiteMetrics() {
++    c2LastRide = keep::Ride{};
++    Cadence = 0;
++    m_watt = 0;
++    Speed = 0;
++}
++
+ void keepbike::btinit() {
+     uint8_t initData1[] = {0x01, 0x4b, 0xf6, 0x00, 0x2e, 0x35, 0x36, 0x64, 0x61, 0x34,
+                            0x32, 0x61, 0x64, 0x64, 0x30, 0x36, 0x63, 0x39, 0x39, 0x38};
+@@ -694,9 +946,18 @@ void keepbike::stateChanged(QLowEnergyService::ServiceState state) {
+ 
+         gattWriteCharacteristic = gattCommunicationChannelService->characteristic(_gattWriteCharacteristicId);
+         gattNotifyCharacteristic = gattCommunicationChannelService->characteristic(_gattNotifyCharacteristicId);
+-        if(!gattWriteCharacteristic.isValid()) {
++        if (c2Lite || !gattWriteCharacteristic.isValid()) {
+             gattWriteCharacteristic = gattCommunicationChannelService->characteristic(_gattNotifyCharacteristicId);
+         }
++        if (c2Lite &&
++            (!gattNotifyCharacteristic.isValid() ||
++             !gattNotifyCharacteristic.properties().testFlag(QLowEnergyCharacteristic::Notify) ||
++             !(gattWriteCharacteristic.properties() &
++               (QLowEnergyCharacteristic::Write | QLowEnergyCharacteristic::WriteNoResponse)) ||
++             !gattNotifyCharacteristic.descriptor(QBluetoothUuid::ClientCharacteristicConfiguration).isValid())) {
++            qDebug().noquote() << QStringLiteral("Keep C2 Lite: missing FF01 Notify, Write or CCCD");
++            return;
++        }
+         Q_ASSERT(gattNotifyCharacteristic.isValid());
+ 
+         // establish hook into notifications
+@@ -755,6 +1016,10 @@ void keepbike::stateChanged(QLowEnergyService::ServiceState state) {
+ }
+ 
+ void keepbike::descriptorWritten(const QLowEnergyDescriptor &descriptor, const QByteArray &newValue) {
++    if (c2Lite && (descriptor != gattNotifyCharacteristic.descriptor(QBluetoothUuid::ClientCharacteristicConfiguration) ||
++                   newValue != QByteArray::fromHex("0100"))) {
++        return;
++    }
+     qDebug() << QStringLiteral("descriptorWritten ") + descriptor.name() + QStringLiteral(" ") + newValue.toHex(' ');
+ 
+     initRequest = true;
+@@ -762,6 +1027,10 @@ void keepbike::descriptorWritten(const QLowEnergyDescriptor &descriptor, const Q
+ }
+ 
+ void keepbike::characteristicWritten(const QLowEnergyCharacteristic &characteristic, const QByteArray &newValue) {
++    if (c2Lite) {
++        // FF01 write acknowledgements can contain captured authentication bytes.
++        return;
++    }
+     Q_UNUSED(characteristic);
+     qDebug() << QStringLiteral("characteristicWritten ") + newValue.toHex(' ');
+ }
+@@ -772,11 +1041,22 @@ void keepbike::serviceScanDone(void) {
+     QBluetoothUuid _gattCommunicationChannelServiceId((quint16)0x00ff);
+ 
+     gattCommunicationChannelService = m_control->createServiceObject(_gattCommunicationChannelServiceId);
++    if (c2Lite && !gattCommunicationChannelService) {
++        qDebug().noquote() << QStringLiteral("Keep C2 Lite: private service 00FF not found");
++        return;
++    }
+     connect(gattCommunicationChannelService, &QLowEnergyService::stateChanged, this, &keepbike::stateChanged);
+     gattCommunicationChannelService->discoverDetails();
+ }
+ 
+ void keepbike::errorService(QLowEnergyService::ServiceError err) {
++    if (c2Lite && err == QLowEnergyService::CharacteristicWriteError) {
++        qDebug().noquote() << QStringLiteral("Keep C2 Lite: FF01 write failed; stopping this session");
++        initDone = false;
++        ++c2WriteGeneration;
++        resetC2LiteMetrics();
++        m_control->disconnectFromDevice();
++    }
+     QMetaEnum metaEnum = QMetaEnum::fromType<QLowEnergyService::ServiceError>();
+     qDebug() << QStringLiteral("keepbike::errorService") + QString::fromLocal8Bit(metaEnum.valueToKey(err)) +
+                     m_control->errorString();
+@@ -793,6 +1073,10 @@ void keepbike::deviceDiscovered(const QBluetoothDeviceInfo &device) {
+                     device.address().toString() + ')';
+     {
+         bluetoothDevice = device;
++        c2Lite = isC2LiteName(device.name());
++        if (c2Lite) {
++            refresh->setInterval(100);
++        }
+ 
+         m_control = QLowEnergyController::createCentral(bluetoothDevice, this);
+         connect(m_control, &QLowEnergyController::serviceDiscovered, this, &keepbike::serviceDiscovered);
+@@ -847,6 +1131,12 @@ void keepbike::controllerStateChanged(QLowEnergyController::ControllerState stat
+         lastResistanceBeforeDisconnection = Resistance.value();
+         qDebug() << QStringLiteral("trying to connect back again...");
+         initDone = false;
++        if (c2Lite) {
++            initRequest = false;
++            c2Handshake.clear();
++            ++c2WriteGeneration;
++            resetC2LiteMetrics();
++        }
+         connectBackLater();
+     }
+ }
+diff --git a/src/devices/keepbike/keepbike.h b/src/devices/keepbike/keepbike.h
+index 53051ea..6a05c55 100644
+--- a/src/devices/keepbike/keepbike.h
++++ b/src/devices/keepbike/keepbike.h
+@@ -23,10 +23,12 @@
+ #include <QtCore/qtimer.h>
+ 
+ #include <QDateTime>
++#include <QElapsedTimer>
+ #include <QObject>
+ #include <QString>
+ 
+ #include "devices/bike.h"
++#include "keep_protocol.h"
+ #include "virtualdevices/virtualbike.h"
+ 
+ #ifdef Q_OS_IOS
+@@ -46,6 +48,7 @@ class keepbike : public bike {
+         uint16_t status = 0;
+     };
+ 
++    static bool isC2LiteName(const QString &name);
+     static bool isNewProtocolFrame(const QByteArray &packet);
+     static uint16_t newProtocolCrc(const QByteArray &packet);
+     static QByteArray buildNewProtocolFrame(uint16_t sequence, quint32 session, const QByteArray &payload);
+@@ -67,6 +70,28 @@ class keepbike : public bike {
+     QTime GetElapsedFromPacket(const QByteArray &packet);
+     void btinit();
+     void btinitNewProtocol();
++    void initC2Lite();
++    void updateC2Lite();
++    void writeC2Lite(const QByteArray &frame);
++    void readC2Lite(const QByteArray &data);
++    void resetC2LiteMetrics();
++
++    bool c2Lite = false;
++    bool c2UseQzProtocol = false;
++    quint64 c2WriteGeneration = 0;
++    keep::Profile c2Profile = keep::Profile::Bridge;
++    keep::Receiver c2Receiver;
++    keep::Ride c2LastRide;
++    QList<QByteArray> c2Handshake;
++    QElapsedTimer c2Clock;
++    qint64 c2NextSend = 0;
++    qint64 c2LastRx = 0;
++    unsigned c2Notifies = 0;
++    bool c2HasData = false;
++    uint8_t c2Sequence = 0;
++    uint16_t c2Counter = 0;
++    uint8_t c2StartCounter = 6;
++
+     void writeCharacteristic(uint8_t *data, uint8_t data_len, const QString &info, bool disable_log = false,
+                              bool wait_for_response = false);
+     void writeNewProtocolCommand(const QByteArray &payload, const QString &info, bool wait_for_response = true);
+diff --git a/src/qdomyos-zwift.pri b/src/qdomyos-zwift.pri
+index 2a906b2..173d8c4 100644
+--- a/src/qdomyos-zwift.pri
++++ b/src/qdomyos-zwift.pri
+@@ -295,6 +295,7 @@ devices/kettlerclassicbike/kettlerclassicprotocol.cpp \
+ devices/inspirebike/inspirebike.cpp \
+ keepawakehelper.cpp \
+ devices/keepbike/keepbike.cpp \
++devices/keepbike/keep_protocol.cpp \
+ devices/kingsmithr1protreadmill/kingsmithr1protreadmill.cpp \
+ devices/kingsmithr2treadmill/kingsmithr2treadmill.cpp \
+ main.cpp \
+@@ -605,6 +606,7 @@ devices/iconceptbike/iconceptbike.h \
+ devices/kettlerclassicbike/kettlerclassicbike.h \
+ devices/kettlerclassicbike/kettlerclassicprotocol.h \
+ devices/keepbike/keepbike.h \
++devices/keepbike/keep_protocol.h \
+ devices/kingsmithr1protreadmill/kingsmithr1protreadmill.h \
+ devices/kingsmithr2treadmill/kingsmithr2treadmill.h \
+ devices/m3ibike/m3ibike.h \
