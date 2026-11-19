@@ -210,7 +210,10 @@ jobs:
         \ assembleDebug\n"
     - name: Show ccache stats
       if: always()
-      run: ccache --show-stats
+      run: |
+        if command -v ccache >/dev/null; then
+          ccache --show-stats
+        fi
     - name: Archive apk binary
       uses: actions/upload-artifact@v4
       with:
