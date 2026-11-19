@@ -22,12 +22,6 @@ jobs:
         sudo docker image prune --all --force || true
         sudo apt-get clean
         df -h /
-    - name: Xvfb install and run
-      run: 'sudo apt-get install -y xvfb
-
-        Xvfb -ac ${{ env.DISPLAY }} -screen 0 1280x780x24 &
-
-        '
     - name: Checkout pinned QZ source
       uses: actions/checkout@v4
       with:
@@ -53,12 +47,20 @@ jobs:
     - name: Install packages required to run QZ inside workflow
       timeout-minutes: 6
       run: |
-        apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=25 -o Acquire::https::Timeout=25)
-        sudo apt-get "${apt_options[@]}" update
-        sudo apt-get "${apt_options[@]}" install -y qtbase5-dev qtchooser qt5-qmake qtbase5-dev-tools qttools5-dev-tools \
+        apt_sources="$(mktemp)"
+        chmod 644 "$apt_sources"
+        mirror=https://mirrors.edge.kernel.org/ubuntu
+        for suite in jammy jammy-updates jammy-security; do
+          printf 'deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] %s %s main universe\n' "$mirror" "$suite"
+        done > "$apt_sources"
+        apt_options=(-o "Dir::Etc::sourcelist=$apt_sources" -o Dir::Etc::sourceparts=- \
+          -o Acquire::Retries=2 -o Acquire::https::Timeout=25)
+        sudo apt-get "${apt_options[@]}" update --error-on=any
+        sudo apt-get "${apt_options[@]}" install -y xvfb ccache qtbase5-dev qtchooser qt5-qmake qtbase5-dev-tools qttools5-dev-tools \
           qtquickcontrols2-5-dev libqt5bluetooth5 libqt5widgets5 libqt5positioning5 libqt5xml5 qtconnectivity5-dev \
           qtpositioning5-dev libqt5charts5-dev libqt5charts5 libqt5networkauth5-dev 'libqt5websockets5*' libxcb-randr0-dev \
           libxcb-xtest0-dev libxcb-xinerama0-dev libxcb-shape0-dev libxcb-xkb-dev
+        Xvfb -ac ${{ env.DISPLAY }} -screen 0 1280x780x24 &
     - name: Install Qt Android
       uses: jdpurcell/install-qt-action@v5
       with:
@@ -115,9 +117,7 @@ jobs:
         \nif [ -d \"$SDK_ROOT/platforms/android-37.0\" ] && [ ! -e \"$SDK_ROOT/platforms/android-37\" ]; then\n\
         \  ln -s android-37.0 \"$SDK_ROOT/platforms/android-37\"\nfi\n"
     - name: Setup ccache
-      run: 'sudo apt-get install -y ccache
-
-        echo "CCACHE_DIR=${{ github.workspace }}/.ccache" >> $GITHUB_ENV
+      run: 'echo "CCACHE_DIR=${{ github.workspace }}/.ccache" >> $GITHUB_ENV
 
         ccache --set-config=max_size=2G
 
