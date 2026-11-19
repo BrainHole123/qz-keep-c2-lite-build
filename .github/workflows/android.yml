@@ -146,11 +146,11 @@ jobs:
         nexec /usr/bin/ccache %s/clang++.real \"$@\"\\n' \"$NDK_BIN\" > $NDK_BIN/clang++\nchmod +x $NDK_BIN/clang\
         \ $NDK_BIN/clang++\n"
     - name: Prepare standalone build without service credentials
-      run: 'printf ''%s\n'' ''#define STRAVA_SECRET_KEY'' ''#define PELOTON_SECRET_KEY'' ''#define SMTP_USERNAME''
-        ''#define SMTP_PASSWORD'' ''#define SMTP_SERVER'' ''#define INTERVALSICU_CLIENT_ID'' ''#define INTERVALSICU_CLIENT_SECRET''
-        ''#define LICENSE'' > src/secret.h
-
-        printf ''\n'' > src/inner_templates/googlemaps/cesium-key.js'
+      run: |
+        printf '%s\n' '#define STRAVA_SECRET_KEY' '#define PELOTON_SECRET_KEY' \
+          '#define SMTP_USERNAME' '#define SMTP_PASSWORD' '#define SMTP_SERVER' \
+          '#define INTERVALSICU_CLIENT_ID' '#define INTERVALSICU_CLIENT_SECRET' > src/secret.h
+        printf '\n' > src/inner_templates/googlemaps/cesium-key.js
     - name: Build qthttpserver for Android
       run: 'cd src/qthttpserver
 
