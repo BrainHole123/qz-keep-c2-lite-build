@@ -14,10 +14,10 @@ index e59ee95..c118846 100644
                  keepBike = new keepbike(noWriteResistance, noHeartService, bikeResistanceOffset, bikeResistanceGain);
 diff --git a/src/devices/keepbike/keep_protocol.cpp b/src/devices/keepbike/keep_protocol.cpp
 new file mode 100644
-index 0000000..9eb21b1
+index 0000000..5b595dc
 --- /dev/null
 +++ b/src/devices/keepbike/keep_protocol.cpp
-@@ -0,0 +1,211 @@
+@@ -0,0 +1,247 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +#include "keep_protocol.h"
 +
@@ -108,12 +108,35 @@ index 0000000..9eb21b1
 +    return finishFrame(frame, sequence, sizeof(body));
 +}
 +
-+bool decodeRide(const uint8_t *payload, size_t size, Ride &ride) {
++bool decodeRide(const uint8_t *payload, size_t size, Ride &ride, bool modeResistance) {
++    constexpr uint8_t AuthReply[]{0x02, 0xb5, '1', '0', '6', '/', '3'};
++    if (modeResistance && size == 12 + sizeof(AuthReply) &&
++        payload[4] == 0x55 && payload[5] == 0x45 &&
++        std::equal(std::begin(AuthReply), std::end(AuthReply), payload + 12)) {
++        ride = Ride{};
++        ride.hasAuthReply = true;
++        ride.authSession = le16(payload + 6) | (uint32_t(le16(payload + 8)) << 16);
++        return true;
++    }
++    // C2 Lite 1.0.4 responds to rejected writes with a 4.01 code in the
++    // message header and the 106/6 path, without a Protobuf body.
++    constexpr uint8_t DeniedResistance[]{0x02, 0xb5, '1', '0', '6', '/', '6'};
++    if (modeResistance && size == 12 + sizeof(DeniedResistance) &&
++        payload[4] == 0x55 && payload[5] == 0x81 &&
++        std::equal(std::begin(DeniedResistance), std::end(DeniedResistance), payload + 12)) {
++        ride = Ride{};
++        ride.resistanceUnauthorized = true;
++        return true;
++    }
 +    const uint8_t *end = payload + size;
 +    const uint8_t *marker = std::search(payload, end, std::begin(MetricsMarker), std::end(MetricsMarker));
-+    if (marker == end) {
-+        return false;
++    constexpr uint8_t ModeMarker[]{0xb5, '1', '0', '6', '/', '6', 0xff};
++    bool modeReport = false;
++    if (marker == end && modeResistance) {
++        marker = std::search(payload, end, std::begin(ModeMarker), std::end(ModeMarker));
++        modeReport = marker != end;
 +    }
++    if (marker == end) return false;
 +    const uint8_t *cursor = marker + sizeof(MetricsMarker);
 +    Ride result{};
 +    bool hasMetrics = false;
@@ -163,16 +186,29 @@ index 0000000..9eb21b1
 +        if (field >= 2 && field <= 8 && value > UINT32_MAX) {
 +            return false;
 +        }
++        if (modeReport) {
++            if (field == 1) {
++                if (wireType != 0 || value < 1 || value > 24) return false;
++                result.resistance = value;
++            }
++            continue;
++        }
 +        switch (field) {
 +        case 2: result.distance = value; result.hasDistance = true; break;
 +        case 3: result.seconds = value; result.hasSeconds = true; break;
 +        case 4: result.calories = value; break;
-+        case 5: result.resistance = value; break;
++        case 5: if (!modeResistance) result.resistance = value; break;
 +        case 6: result.cadence = value; hasMetrics = true; break;
 +        case 7: result.power = value; hasMetrics = true; break;
 +        case 8: result.status = value; result.hasStatus = true; break;
 +        default: break;
 +        }
++    }
++    if (modeReport) {
++        if (!result.resistance) return false;
++        result.resistanceOnly = true;
++        ride = result;
++        return true;
 +    }
 +    if (!hasMetrics && !result.hasStatus && !(result.hasSeconds && result.hasDistance)) {
 +        return false;
@@ -211,7 +247,7 @@ index 0000000..9eb21b1
 +            discard(1);
 +            continue;
 +        }
-+        const bool decoded = decodeRide(buffer.data() + 6, payloadSize, ride);
++        const bool decoded = decodeRide(buffer.data() + 6, payloadSize, ride, modeResistance);
 +        discard(frameSize);
 +        if (decoded) {
 +            return true;
@@ -231,10 +267,10 @@ index 0000000..9eb21b1
 +} // namespace keep
 diff --git a/src/devices/keepbike/keep_protocol.h b/src/devices/keepbike/keep_protocol.h
 new file mode 100644
-index 0000000..893409d
+index 0000000..e0566f2
 --- /dev/null
 +++ b/src/devices/keepbike/keep_protocol.h
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,62 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +#pragma once
 +
@@ -257,6 +293,10 @@ index 0000000..893409d
 +    uint32_t cadence = 0;
 +    uint32_t power = 0;
 +    uint32_t status = 0;
++    bool resistanceOnly = false;
++    bool resistanceUnauthorized = false;
++    bool hasAuthReply = false;
++    uint32_t authSession = 0;
 +    bool hasDistance = false;
 +    bool hasSeconds = false;
 +    bool hasStatus = false;
@@ -275,16 +315,18 @@ index 0000000..893409d
 +size_t heartbeat(Frame &frame, Profile profile, uint8_t sequence, uint16_t counter, const Ride &ride);
 +size_t startRide(Frame &frame, Profile profile, uint8_t sequence, uint8_t counter);
 +size_t setResistance(Frame &frame, uint8_t sequence, uint8_t counter, unsigned level);
-+bool decodeRide(const uint8_t *payload, size_t size, Ride &ride);
++bool decodeRide(const uint8_t *payload, size_t size, Ride &ride, bool modeResistance = false);
 +std::array<uint8_t, 8> indoorBikeData(uint16_t speedHundredths, uint32_t cadence, uint32_t watts);
 +
 +class Receiver {
 +public:
++    explicit Receiver(bool modeResistance = false) : modeResistance(modeResistance) {}
 +    void clear() { used = 0; }
 +    bool push(uint8_t byte, Ride &ride);
 +    unsigned badFrames = 0;
 +
 +private:
++    bool modeResistance;
 +    void discard(size_t size);
 +    Frame buffer{};
 +    size_t used = 0;
@@ -292,7 +334,7 @@ index 0000000..893409d
 +
 +} // namespace keep
 diff --git a/src/devices/keepbike/keepbike.cpp b/src/devices/keepbike/keepbike.cpp
-index 2464b62..1d26599 100644
+index 2464b62..b896441 100644
 --- a/src/devices/keepbike/keepbike.cpp
 +++ b/src/devices/keepbike/keepbike.cpp
 @@ -3,6 +3,11 @@
@@ -307,7 +349,18 @@ index 2464b62..1d26599 100644
  #include <QMetaEnum>
  #include <QSettings>
  #include <chrono>
-@@ -56,6 +61,10 @@ uint8_t newProtocolMessageType(const QByteArray &payload) {
+@@ -45,7 +50,9 @@ void appendVarint(QByteArray &packet, quint32 value) {
+ }
+ 
+ uint8_t newProtocolMessageType(const QByteArray &payload) {
+-    if (payload.startsWith(QByteArray::fromHex("02b53130362f34"))) {
++    if (payload.startsWith(QByteArray::fromHex("02b53130362f34")) ||
++        payload.startsWith(QByteArray::fromHex("02b53130362f33ff")) ||
++        payload.startsWith(QByteArray::fromHex("02b53130362f36ff"))) {
+         return 0x03;
+     }
+     return 0x01;
+@@ -56,6 +63,10 @@ uint8_t newProtocolMessageType(const QByteArray &payload) {
  extern quint8 QZ_EnableDiscoveryCharsAndDescripttors;
  #endif
  
@@ -318,7 +371,7 @@ index 2464b62..1d26599 100644
  uint16_t keepbike::newProtocolCrc(const QByteArray &packet) {
      uint16_t crc = 0;
      for (const char rawByte : packet) {
-@@ -334,11 +343,27 @@ void keepbike::forceResistance(resistance_t requestResistance) {
+@@ -334,11 +345,27 @@ void keepbike::forceResistance(resistance_t requestResistance) {
  
  void keepbike::update() {
  
@@ -346,7 +399,7 @@ index 2464b62..1d26599 100644
      if (initRequest) {
          initRequest = false;
          btinit();
-@@ -416,7 +441,12 @@ double keepbike::bikeResistanceToPeloton(double resistance) {
+@@ -416,7 +443,12 @@ double keepbike::bikeResistanceToPeloton(double resistance) {
  void keepbike::characteristicChanged(const QLowEnergyCharacteristic &characteristic, const QByteArray &newValue) {
      QDateTime now = QDateTime::currentDateTime();
      // qDebug() << "characteristicChanged" << characteristic.uuid() << newValue << newValue.length();
@@ -360,14 +413,15 @@ index 2464b62..1d26599 100644
  
      if (isNewProtocolFrame(newValue)) {
          newProtocol = true;
-@@ -623,6 +653,263 @@ double keepbike::GetSpeedFromPacket(const QByteArray &packet) {
+@@ -623,6 +655,325 @@ double keepbike::GetSpeedFromPacket(const QByteArray &packet) {
      return data;
  }
  
 +void keepbike::initC2Lite() {
-+    const QString path = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) +
-+                         QStringLiteral("/keep-c2-lite.json");
-+    QFile file(path);
++    const QString dataPath = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
++    QFile file(dataPath + QStringLiteral("/keep-c2-lite.json"));
++    c2AuthPut = false;
++    c2AuthConfirmed = false;
 +    QJsonObject identity;
 +    if (file.exists()) {
 +        if (!file.open(QIODevice::ReadOnly)) {
@@ -377,14 +431,27 @@ index 2464b62..1d26599 100644
 +        identity = QJsonDocument::fromJson(file.read(16385)).object();
 +    } else {
 +        // Same upstream QZ payloads tested against C2 Lite firmware 1.0.4.
-+        // A personal Keep App capture was not needed on that bicycle.
++        // The default handshake was sufficient for telemetry on that bicycle.
 +        newProtocolSession = static_cast<quint32>(QDateTime::currentMSecsSinceEpoch() & 0xffffffff);
 +        QJsonArray packets;
-+        const QList<QByteArray> payloads{
++        QList<QByteArray> payloads{
 +            QByteArray::fromHex("01b3312f31ff6134633664323438353566623930376300"),
 +            QByteArray::fromHex("046100553130362f33ff0a18353966393532633231636633643130393064366138376333121066643265353031653665356464363230"),
 +            QByteArray::fromHex("046100553130362f36"),
 +            QByteArray::fromHex("046100553130362f34")};
++        QFile localAuth(dataPath + QStringLiteral("/keep-c2-auth.bin"));
++        if (localAuth.open(QIODevice::ReadOnly)) {
++            QByteArray auth = localAuth.read(51);
++            if (auth.size() == 50 && auth.startsWith(QByteArray::fromHex("0a18")) &&
++                auth.mid(26, 2) == QByteArray::fromHex("1210") &&
++                uint8_t(auth.at(44)) == 0x1d && uint8_t(auth.at(49)) == 0x20) {
++                appendVarint(auth, quint32(QDateTime::currentSecsSinceEpoch()));
++                payloads[1] = QByteArray::fromHex("02b53130362f33ff") + auth;
++                c2AuthPut = true;
++            } else {
++                qDebug() << "Keep C2 Lite: invalid local auth template";
++            }
++        }
 +        uint16_t sequence = 0x00a0;
 +        for (const auto &payload : payloads) {
 +            packets.append(QString::fromLatin1(buildNewProtocolFrame(sequence, newProtocolSession, payload).toHex()));
@@ -444,7 +511,7 @@ index 2464b62..1d26599 100644
 +    ++c2WriteGeneration;
 +    c2Profile = profile == QStringLiteral("BikeCon") ? keep::Profile::BikeCon : keep::Profile::Bridge;
 +    c2Handshake = validated;
-+    c2Receiver = keep::Receiver{};
++    c2Receiver = keep::Receiver{true};
 +    c2Notifies = 0;
 +    c2HasData = false;
 +    c2Sequence = c2Profile == keep::Profile::Bridge ? 4 : 0;
@@ -453,6 +520,8 @@ index 2464b62..1d26599 100644
 +    c2ResistanceTarget = -1;
 +    c2ResistanceAttempts = 0;
 +    c2ResistanceSentAt = -2000;
++    c2ResistanceQueryPending = false;
++    c2ResistanceUnauthorized = false;
 +    c2Clock.start();
 +    c2NextSend = 0;
 +    c2LastRx = 0;
@@ -501,7 +570,8 @@ index 2464b62..1d26599 100644
 +        resetC2LiteMetrics();
 +    }
 +    update_metrics(false, watts());
-+    if (noWriteResistance || !autoResistance()) {
++    if (c2ResistanceUnauthorized || (c2UseQzProtocol && !c2AuthPut) ||
++        noWriteResistance || !autoResistance()) {
 +        requestResistance = -1;
 +        c2ResistanceTarget = -1;
 +    } else if (requestResistance != -1) {
@@ -541,17 +611,34 @@ index 2464b62..1d26599 100644
 +        return;
 +    }
 +
++    if (c2ResistanceQueryPending) {
++        c2ResistanceQueryPending = false;
++        writeC2Lite(buildNewProtocolFrame(uint16_t(0x00a0 | (uint16_t(c2Sequence++) << 8)),
++                                         newProtocolSession, QByteArray::fromHex("046100553130362f36")));
++        c2NextSend = qMax(c2NextSend, now + 300);
++        return;
++    }
++
 +    // At most one command per two seconds. Keep polling between attempts;
 +    // a GATT write ACK alone is not proof that the bike changed resistance.
-+    if (c2ResistanceTarget > 0 && c2HasData && now - c2LastRx < 4000 &&
++    if (c2ResistanceTarget > 0 && (!c2AuthPut || c2AuthConfirmed) &&
++        c2HasData && c2LastRide.status == 3 && now - c2LastRx < 4000 &&
 +        now - c2ResistanceSentAt >= 2000) {
 +        if (c2ResistanceAttempts >= 3) {
 +            qDebug() << "Keep C2 Lite: resistance not confirmed; giving up target" << c2ResistanceTarget;
 +            c2ResistanceTarget = -1;
 +        } else {
-+            const size_t size = keep::setResistance(frame, c2Sequence++, c2StartCounter++, unsigned(c2ResistanceTarget));
-+            writeC2Lite(QByteArray(reinterpret_cast<const char *>(frame.data()), int(size)));
++            if (c2AuthPut) {
++                QByteArray payload = QByteArray::fromHex("02b53130362f36ff08");
++                payload.append(char(c2ResistanceTarget));
++                writeC2Lite(buildNewProtocolFrame(uint16_t(0x00a0 | (uint16_t(c2Sequence++) << 8)),
++                                                 newProtocolSession, payload));
++            } else {
++                const size_t size = keep::setResistance(frame, c2Sequence++, c2StartCounter++, unsigned(c2ResistanceTarget));
++                writeC2Lite(QByteArray(reinterpret_cast<const char *>(frame.data()), int(size)));
++            }
 +            c2ResistanceSentAt = now;
++            c2ResistanceQueryPending = c2UseQzProtocol;
 +            ++c2ResistanceAttempts;
 +            qDebug() << "Keep C2 Lite: requested resistance" << c2ResistanceTarget << "attempt" << c2ResistanceAttempts;
 +            c2NextSend = qMax(c2NextSend, now + 300);
@@ -578,6 +665,34 @@ index 2464b62..1d26599 100644
 +            continue;
 +        }
 +
++        if (ride.hasAuthReply) {
++            if (c2AuthPut && ride.authSession == newProtocolSession && !c2AuthConfirmed) {
++                c2AuthConfirmed = true;
++                qDebug() << "Keep C2 Lite: control session confirmed";
++            }
++            continue;
++        }
++        if (ride.resistanceUnauthorized) {
++            if (!c2ResistanceUnauthorized) {
++                qDebug() << "Keep C2 Lite: bike returned 4.01 Unauthorized; disabling resistance writes for this connection";
++                c2ResistanceUnauthorized = true;
++                c2ResistanceTarget = -1;
++                requestResistance = -1;
++                c2ResistanceQueryPending = false;
++            }
++            continue;
++        }
++        if (ride.resistanceOnly) {
++            c2LastRide.resistance = ride.resistance;
++            Resistance = ride.resistance;
++            emit resistanceRead(Resistance.value());
++            m_pelotonResistance = bikeResistanceToPeloton(Resistance.value());
++            qDebug() << "Keep C2 Lite: actual resistance (106/6)" << ride.resistance;
++            continue;
++        }
++        // Firmware 1.0.4 reports physical gear in 106/6 field 1.
++        // 106/7 field 5 stayed at 1 during a verified manual 1-4-1 sweep.
++        ride.resistance = c2LastRide.resistance;
 +        if (!ride.hasStatus) {
 +            ride.status = c2LastRide.status;
 +        }
@@ -624,7 +739,7 @@ index 2464b62..1d26599 100644
  void keepbike::btinit() {
      uint8_t initData1[] = {0x01, 0x4b, 0xf6, 0x00, 0x2e, 0x35, 0x36, 0x64, 0x61, 0x34,
                             0x32, 0x61, 0x64, 0x64, 0x30, 0x36, 0x63, 0x39, 0x39, 0x38};
-@@ -694,9 +981,18 @@ void keepbike::stateChanged(QLowEnergyService::ServiceState state) {
+@@ -694,9 +1045,18 @@ void keepbike::stateChanged(QLowEnergyService::ServiceState state) {
  
          gattWriteCharacteristic = gattCommunicationChannelService->characteristic(_gattWriteCharacteristicId);
          gattNotifyCharacteristic = gattCommunicationChannelService->characteristic(_gattNotifyCharacteristicId);
@@ -644,7 +759,7 @@ index 2464b62..1d26599 100644
          Q_ASSERT(gattNotifyCharacteristic.isValid());
  
          // establish hook into notifications
-@@ -755,6 +1051,10 @@ void keepbike::stateChanged(QLowEnergyService::ServiceState state) {
+@@ -755,6 +1115,10 @@ void keepbike::stateChanged(QLowEnergyService::ServiceState state) {
  }
  
  void keepbike::descriptorWritten(const QLowEnergyDescriptor &descriptor, const QByteArray &newValue) {
@@ -655,7 +770,7 @@ index 2464b62..1d26599 100644
      qDebug() << QStringLiteral("descriptorWritten ") + descriptor.name() + QStringLiteral(" ") + newValue.toHex(' ');
  
      initRequest = true;
-@@ -762,6 +1062,10 @@ void keepbike::descriptorWritten(const QLowEnergyDescriptor &descriptor, const Q
+@@ -762,6 +1126,10 @@ void keepbike::descriptorWritten(const QLowEnergyDescriptor &descriptor, const Q
  }
  
  void keepbike::characteristicWritten(const QLowEnergyCharacteristic &characteristic, const QByteArray &newValue) {
@@ -666,7 +781,7 @@ index 2464b62..1d26599 100644
      Q_UNUSED(characteristic);
      qDebug() << QStringLiteral("characteristicWritten ") + newValue.toHex(' ');
  }
-@@ -772,11 +1076,22 @@ void keepbike::serviceScanDone(void) {
+@@ -772,11 +1140,22 @@ void keepbike::serviceScanDone(void) {
      QBluetoothUuid _gattCommunicationChannelServiceId((quint16)0x00ff);
  
      gattCommunicationChannelService = m_control->createServiceObject(_gattCommunicationChannelServiceId);
@@ -689,7 +804,7 @@ index 2464b62..1d26599 100644
      QMetaEnum metaEnum = QMetaEnum::fromType<QLowEnergyService::ServiceError>();
      qDebug() << QStringLiteral("keepbike::errorService") + QString::fromLocal8Bit(metaEnum.valueToKey(err)) +
                      m_control->errorString();
-@@ -793,6 +1108,10 @@ void keepbike::deviceDiscovered(const QBluetoothDeviceInfo &device) {
+@@ -793,6 +1172,10 @@ void keepbike::deviceDiscovered(const QBluetoothDeviceInfo &device) {
                      device.address().toString() + ')';
      {
          bluetoothDevice = device;
@@ -700,7 +815,7 @@ index 2464b62..1d26599 100644
  
          m_control = QLowEnergyController::createCentral(bluetoothDevice, this);
          connect(m_control, &QLowEnergyController::serviceDiscovered, this, &keepbike::serviceDiscovered);
-@@ -847,6 +1166,14 @@ void keepbike::controllerStateChanged(QLowEnergyController::ControllerState stat
+@@ -847,6 +1230,14 @@ void keepbike::controllerStateChanged(QLowEnergyController::ControllerState stat
          lastResistanceBeforeDisconnection = Resistance.value();
          qDebug() << QStringLiteral("trying to connect back again...");
          initDone = false;
@@ -716,7 +831,7 @@ index 2464b62..1d26599 100644
      }
  }
 diff --git a/src/devices/keepbike/keepbike.h b/src/devices/keepbike/keepbike.h
-index 53051ea..28a8f71 100644
+index 53051ea..6ee2a66 100644
 --- a/src/devices/keepbike/keepbike.h
 +++ b/src/devices/keepbike/keepbike.h
 @@ -23,10 +23,12 @@
@@ -749,7 +864,7 @@ index 53051ea..28a8f71 100644
      bool connected() override;
  
    private:
-@@ -67,6 +70,31 @@ class keepbike : public bike {
+@@ -67,6 +70,35 @@ class keepbike : public bike {
      QTime GetElapsedFromPacket(const QByteArray &packet);
      void btinit();
      void btinitNewProtocol();
@@ -774,6 +889,10 @@ index 53051ea..28a8f71 100644
 +    uint8_t c2Sequence = 0;
 +    uint16_t c2Counter = 0;
 +    uint8_t c2StartCounter = 6;
++    bool c2ResistanceQueryPending = false;
++    bool c2ResistanceUnauthorized = false;
++    bool c2AuthPut = false;
++    bool c2AuthConfirmed = false;
 +    int c2ResistanceTarget = -1;
 +    unsigned c2ResistanceAttempts = 0;
 +    qint64 c2ResistanceSentAt = -2000;

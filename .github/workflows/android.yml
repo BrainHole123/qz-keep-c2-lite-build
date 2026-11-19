@@ -44,6 +44,10 @@ jobs:
       run: 'git apply --check build-inputs/qz-patch/keep-c2-lite.patch
 
         git apply build-inputs/qz-patch/keep-c2-lite.patch'
+    - name: Set separate Android test app identity
+      run: |
+        sed -i 's/applicationId = "org.cagnulen.qdomyoszwift"/applicationId = "org.cagnulen.qdomyoszwift.keepc2"/' src/android/build.gradle
+        sed -i 's/android:authorities="org.cagnulen.qdomyoszwift.support"/android:authorities="${applicationId}.support"/; s/android:label="QZ"/android:label="QZ C2 Lite"/' src/android/AndroidManifest.xml
     - name: Checkout submodules with specific branches
       run: "git submodule init\ngit submodule update --init --recursive \n"
     - name: Install packages required to run QZ inside workflow
