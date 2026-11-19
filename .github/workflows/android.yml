@@ -59,7 +59,10 @@ jobs:
         sudo apt-get "${apt_options[@]}" install -y xvfb ccache qtbase5-dev qtchooser qt5-qmake qtbase5-dev-tools qttools5-dev-tools \
           qtquickcontrols2-5-dev libqt5bluetooth5 libqt5widgets5 libqt5positioning5 libqt5xml5 qtconnectivity5-dev \
           qtpositioning5-dev libqt5charts5-dev libqt5charts5 libqt5networkauth5-dev 'libqt5websockets5*' libxcb-randr0-dev \
-          libxcb-xtest0-dev libxcb-xinerama0-dev libxcb-shape0-dev libxcb-xkb-dev
+          libxcb-xtest0-dev libxcb-xinerama0-dev libxcb-shape0-dev libxcb-xkb-dev \
+          build-essential libgl1-mesa-dev libgstreamer-gl1.0-0 libpulse-dev libxcb-glx0 libxcb-icccm4 \
+          libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-render0 libxcb-shape0 \
+          libxcb-shm0 libxcb-sync1 libxcb-util1 libxcb-xfixes0 libxcb-xinerama0 libxcb1 libxkbcommon-dev libxkbcommon-x11-0
         Xvfb -ac ${{ env.DISPLAY }} -screen 0 1280x780x24 &
     - name: Install Qt Android
       uses: jdpurcell/install-qt-action@v5
@@ -70,6 +73,7 @@ jobs:
         arch: android
         modules: qtcharts qtnetworkauth qtpurchasing
         dir: ${{ github.workspace }}/output/android/
+        install-deps: 'false'
         cache: 'false'
     - name: Install custom 16K-page-size Qt (overlay onto stock Qt install)
       run: 'QT_DIR="${{ github.workspace }}/output/android/Qt/5.15.0/android"
