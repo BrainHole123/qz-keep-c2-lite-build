@@ -334,7 +334,7 @@ index 0000000..e0566f2
 +
 +} // namespace keep
 diff --git a/src/devices/keepbike/keepbike.cpp b/src/devices/keepbike/keepbike.cpp
-index 2464b62..b896441 100644
+index 2464b62..7da4dda 100644
 --- a/src/devices/keepbike/keepbike.cpp
 +++ b/src/devices/keepbike/keepbike.cpp
 @@ -3,6 +3,11 @@
@@ -413,7 +413,7 @@ index 2464b62..b896441 100644
  
      if (isNewProtocolFrame(newValue)) {
          newProtocol = true;
-@@ -623,6 +655,325 @@ double keepbike::GetSpeedFromPacket(const QByteArray &packet) {
+@@ -623,6 +655,329 @@ double keepbike::GetSpeedFromPacket(const QByteArray &packet) {
      return data;
  }
  
@@ -440,6 +440,10 @@ index 2464b62..b896441 100644
 +            QByteArray::fromHex("046100553130362f36"),
 +            QByteArray::fromHex("046100553130362f34")};
 +        QFile localAuth(dataPath + QStringLiteral("/keep-c2-auth.bin"));
++#ifdef Q_OS_ANDROID
++        if (!localAuth.exists())
++            localAuth.setFileName(QStringLiteral("assets:/keep-c2-auth.bin"));
++#endif
 +        if (localAuth.open(QIODevice::ReadOnly)) {
 +            QByteArray auth = localAuth.read(51);
 +            if (auth.size() == 50 && auth.startsWith(QByteArray::fromHex("0a18")) &&
@@ -739,7 +743,7 @@ index 2464b62..b896441 100644
  void keepbike::btinit() {
      uint8_t initData1[] = {0x01, 0x4b, 0xf6, 0x00, 0x2e, 0x35, 0x36, 0x64, 0x61, 0x34,
                             0x32, 0x61, 0x64, 0x64, 0x30, 0x36, 0x63, 0x39, 0x39, 0x38};
-@@ -694,9 +1045,18 @@ void keepbike::stateChanged(QLowEnergyService::ServiceState state) {
+@@ -694,9 +1049,18 @@ void keepbike::stateChanged(QLowEnergyService::ServiceState state) {
  
          gattWriteCharacteristic = gattCommunicationChannelService->characteristic(_gattWriteCharacteristicId);
          gattNotifyCharacteristic = gattCommunicationChannelService->characteristic(_gattNotifyCharacteristicId);
@@ -759,7 +763,7 @@ index 2464b62..b896441 100644
          Q_ASSERT(gattNotifyCharacteristic.isValid());
  
          // establish hook into notifications
-@@ -755,6 +1115,10 @@ void keepbike::stateChanged(QLowEnergyService::ServiceState state) {
+@@ -755,6 +1119,10 @@ void keepbike::stateChanged(QLowEnergyService::ServiceState state) {
  }
  
  void keepbike::descriptorWritten(const QLowEnergyDescriptor &descriptor, const QByteArray &newValue) {
@@ -770,7 +774,7 @@ index 2464b62..b896441 100644
      qDebug() << QStringLiteral("descriptorWritten ") + descriptor.name() + QStringLiteral(" ") + newValue.toHex(' ');
  
      initRequest = true;
-@@ -762,6 +1126,10 @@ void keepbike::descriptorWritten(const QLowEnergyDescriptor &descriptor, const Q
+@@ -762,6 +1130,10 @@ void keepbike::descriptorWritten(const QLowEnergyDescriptor &descriptor, const Q
  }
  
  void keepbike::characteristicWritten(const QLowEnergyCharacteristic &characteristic, const QByteArray &newValue) {
@@ -781,7 +785,7 @@ index 2464b62..b896441 100644
      Q_UNUSED(characteristic);
      qDebug() << QStringLiteral("characteristicWritten ") + newValue.toHex(' ');
  }
-@@ -772,11 +1140,22 @@ void keepbike::serviceScanDone(void) {
+@@ -772,11 +1144,22 @@ void keepbike::serviceScanDone(void) {
      QBluetoothUuid _gattCommunicationChannelServiceId((quint16)0x00ff);
  
      gattCommunicationChannelService = m_control->createServiceObject(_gattCommunicationChannelServiceId);
@@ -804,7 +808,7 @@ index 2464b62..b896441 100644
      QMetaEnum metaEnum = QMetaEnum::fromType<QLowEnergyService::ServiceError>();
      qDebug() << QStringLiteral("keepbike::errorService") + QString::fromLocal8Bit(metaEnum.valueToKey(err)) +
                      m_control->errorString();
-@@ -793,6 +1172,10 @@ void keepbike::deviceDiscovered(const QBluetoothDeviceInfo &device) {
+@@ -793,6 +1176,10 @@ void keepbike::deviceDiscovered(const QBluetoothDeviceInfo &device) {
                      device.address().toString() + ')';
      {
          bluetoothDevice = device;
@@ -815,7 +819,7 @@ index 2464b62..b896441 100644
  
          m_control = QLowEnergyController::createCentral(bluetoothDevice, this);
          connect(m_control, &QLowEnergyController::serviceDiscovered, this, &keepbike::serviceDiscovered);
-@@ -847,6 +1230,14 @@ void keepbike::controllerStateChanged(QLowEnergyController::ControllerState stat
+@@ -847,6 +1234,14 @@ void keepbike::controllerStateChanged(QLowEnergyController::ControllerState stat
          lastResistanceBeforeDisconnection = Resistance.value();
          qDebug() << QStringLiteral("trying to connect back again...");
          initDone = false;
