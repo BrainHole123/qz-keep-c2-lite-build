@@ -6,7 +6,7 @@ permissions:
 env:
   DISPLAY: :99
 concurrency:
-  group: keep-c2-android
+  group: keep-c2-android-fast
   cancel-in-progress: false
 jobs:
   android-build:
@@ -40,8 +40,8 @@ jobs:
         git apply build-inputs/qz-patch/keep-c2-lite.patch'
     - name: Set separate Android test app identity
       run: |
-        sed -i 's/applicationId = "org.cagnulen.qdomyoszwift"/applicationId = "org.cagnulen.qdomyoszwift.keepc2"/' src/android/build.gradle
-        sed -i 's/android:authorities="org.cagnulen.qdomyoszwift.support"/android:authorities="${applicationId}.support"/; s/android:label="QZ"/android:label="QZ C2 Lite"/' src/android/AndroidManifest.xml
+        sed -i 's/applicationId = "org.cagnulen.qdomyoszwift"/applicationId = "org.cagnulen.qdomyoszwift.keepc2.fast"/' src/android/build.gradle
+        sed -i 's/android:authorities="org.cagnulen.qdomyoszwift.support"/android:authorities="${applicationId}.support"/; s/android:label="QZ"/android:label="QZ C2 Lite Fast"/' src/android/AndroidManifest.xml
     - name: Checkout submodules with specific branches
       run: "git submodule init\ngit submodule update --init --recursive \n"
     - name: Install packages required to run QZ inside workflow
@@ -221,7 +221,7 @@ jobs:
     - name: Archive apk binary
       uses: actions/upload-artifact@v4
       with:
-        name: qz-keep-c2-lite-debug
+        name: qz-keep-c2-lite-fast-debug
         path: ${{ github.workspace }}/output/android/build/outputs/apk/debug/android-debug.apk
         retention-days: 7
         if-no-files-found: error

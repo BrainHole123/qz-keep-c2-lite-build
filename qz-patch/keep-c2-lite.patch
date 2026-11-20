@@ -12,6 +12,28 @@ index e59ee95..c118846 100644
                  this->setLastBluetoothDevice(b);
                  this->stopDiscovery();
                  keepBike = new keepbike(noWriteResistance, noHeartService, bikeResistanceOffset, bikeResistanceGain);
+diff --git a/src/devices/dircon/dirconmanager.cpp b/src/devices/dircon/dirconmanager.cpp
+index 11af67b..cb49640 100644
+--- a/src/devices/dircon/dirconmanager.cpp
++++ b/src/devices/dircon/dirconmanager.cpp
+@@ -1,5 +1,6 @@
+ #include "devices/dircon/dirconmanager.h"
+ #include "devices/bike.h"
++#include "devices/keepbike/keepbike.h"
+ #include <QNetworkInterface>
+ #include <QSettings>
+ #include <chrono>
+@@ -254,7 +255,9 @@ DirconManager::DirconManager(bluetoothdevice *Bike, int8_t bikeResistanceOffset,
+         });
+     }
+     
+-    if (zwift_play_emulator || settings.value(QZSettings::race_mode, QZSettings::default_race_mode).toBool())
++    const bool fastKeep = keepbike::isC2LiteName(Bike->bluetoothDevice.name());
++    if (fastKeep) bikeTimer.setTimerType(Qt::PreciseTimer);
++    if (fastKeep || zwift_play_emulator || settings.value(QZSettings::race_mode, QZSettings::default_race_mode).toBool())
+         bikeTimer.start(50ms);
+     else
+         bikeTimer.start(1s);
 diff --git a/src/devices/keepbike/keep_protocol.cpp b/src/devices/keepbike/keep_protocol.cpp
 new file mode 100644
 index 0000000..5b595dc
@@ -334,7 +356,7 @@ index 0000000..e0566f2
 +
 +} // namespace keep
 diff --git a/src/devices/keepbike/keepbike.cpp b/src/devices/keepbike/keepbike.cpp
-index 2464b62..7da4dda 100644
+index 2464b62..11f7fac 100644
 --- a/src/devices/keepbike/keepbike.cpp
 +++ b/src/devices/keepbike/keepbike.cpp
 @@ -3,6 +3,11 @@
@@ -349,7 +371,19 @@ index 2464b62..7da4dda 100644
  #include <QMetaEnum>
  #include <QSettings>
  #include <chrono>
-@@ -45,7 +50,9 @@ void appendVarint(QByteArray &packet, quint32 value) {
+@@ -15,6 +20,11 @@
+ using namespace std::chrono_literals;
+ 
+ namespace {
++constexpr qint64 C2MinPollIntervalMs = 50;
++constexpr qint64 C2PollTimeoutMs = 350;
++constexpr qint64 C2NormalPollIntervalMs = 1000;
++constexpr unsigned C2MaxPollTimeouts = 3;
++
+ uint16_t toUInt16LE(const QByteArray &packet, int offset) {
+     return (static_cast<uint8_t>(packet.at(offset + 1)) << 8) | static_cast<uint8_t>(packet.at(offset));
+ }
+@@ -45,7 +55,9 @@ void appendVarint(QByteArray &packet, quint32 value) {
  }
  
  uint8_t newProtocolMessageType(const QByteArray &payload) {
@@ -360,7 +394,7 @@ index 2464b62..7da4dda 100644
          return 0x03;
      }
      return 0x01;
-@@ -56,6 +63,10 @@ uint8_t newProtocolMessageType(const QByteArray &payload) {
+@@ -56,6 +68,10 @@ uint8_t newProtocolMessageType(const QByteArray &payload) {
  extern quint8 QZ_EnableDiscoveryCharsAndDescripttors;
  #endif
  
@@ -371,7 +405,7 @@ index 2464b62..7da4dda 100644
  uint16_t keepbike::newProtocolCrc(const QByteArray &packet) {
      uint16_t crc = 0;
      for (const char rawByte : packet) {
-@@ -334,11 +345,27 @@ void keepbike::forceResistance(resistance_t requestResistance) {
+@@ -334,11 +350,27 @@ void keepbike::forceResistance(resistance_t requestResistance) {
  
  void keepbike::update() {
  
@@ -399,7 +433,7 @@ index 2464b62..7da4dda 100644
      if (initRequest) {
          initRequest = false;
          btinit();
-@@ -416,7 +443,12 @@ double keepbike::bikeResistanceToPeloton(double resistance) {
+@@ -416,7 +448,12 @@ double keepbike::bikeResistanceToPeloton(double resistance) {
  void keepbike::characteristicChanged(const QLowEnergyCharacteristic &characteristic, const QByteArray &newValue) {
      QDateTime now = QDateTime::currentDateTime();
      // qDebug() << "characteristicChanged" << characteristic.uuid() << newValue << newValue.length();
@@ -413,7 +447,7 @@ index 2464b62..7da4dda 100644
  
      if (isNewProtocolFrame(newValue)) {
          newProtocol = true;
-@@ -623,6 +655,329 @@ double keepbike::GetSpeedFromPacket(const QByteArray &packet) {
+@@ -623,6 +660,365 @@ double keepbike::GetSpeedFromPacket(const QByteArray &packet) {
      return data;
  }
  
@@ -526,6 +560,10 @@ index 2464b62..7da4dda 100644
 +    c2ResistanceSentAt = -2000;
 +    c2ResistanceQueryPending = false;
 +    c2ResistanceUnauthorized = false;
++    c2PollTimer.stop();
++    c2PollSentAt = 0;
++    c2PollReplyDeadline = 0;
++    c2PollTimeouts = 0;
 +    c2Clock.start();
 +    c2NextSend = 0;
 +    c2LastRx = 0;
@@ -591,6 +629,20 @@ index 2464b62..7da4dda 100644
 +        c2ResistanceTarget = -1;
 +    }
 +    requestStop = -1;
++    sendC2Lite(now);
++}
++
++void keepbike::sendC2Lite(qint64 now) {
++    if (c2PollReplyDeadline) {
++        if (now < c2PollReplyDeadline) return;
++        c2PollReplyDeadline = 0;
++        ++c2PollTimeouts;
++        // Give a slow or busy bike time to recover before the next request.
++        c2NextSend = qMax(c2NextSend, c2PollSentAt + C2NormalPollIntervalMs);
++        if (c2PollTimeouts == C2MaxPollTimeouts) {
++            qDebug() << "Keep C2 Lite: fast polling timed out; using 1 Hz until reconnect";
++        }
++    }
 +    if (now < c2NextSend) {
 +        return;
 +    }
@@ -650,6 +702,13 @@ index 2464b62..7da4dda 100644
 +        }
 +    }
 +
++    const bool fastPoll = c2UseQzProtocol && c2HasData && c2PollTimeouts < C2MaxPollTimeouts;
++    const qint64 interval = fastPoll ? C2MinPollIntervalMs : C2NormalPollIntervalMs;
++    c2NextSend = now + interval;
++    if (fastPoll) {
++        c2PollSentAt = now;
++        c2PollReplyDeadline = now + C2PollTimeoutMs;
++    }
 +    if (c2UseQzProtocol) {
 +        writeC2Lite(buildNewProtocolFrame(uint16_t(0x00a0 | (uint16_t(c2Sequence++) << 8)),
 +                                         newProtocolSession, QByteArray::fromHex("01b53130362f37")));
@@ -658,7 +717,6 @@ index 2464b62..7da4dda 100644
 +        writeC2Lite(QByteArray(reinterpret_cast<const char *>(frame.data()), int(size)));
 +    }
 +    c2Counter += c2Profile == keep::Profile::Bridge ? 1 : 257;
-+    c2NextSend = now + 1000;
 +}
 +
 +void keepbike::readC2Lite(const QByteArray &bytes) {
@@ -710,11 +768,16 @@ index 2464b62..7da4dda 100644
 +
 +        if (!active) {
 +            Speed = 0;
-+        } else if (ride.hasDistance && c2LastRide.hasDistance && ride.hasSeconds && c2LastRide.hasSeconds) {
-+            if (ride.seconds > c2LastRide.seconds && ride.distance >= c2LastRide.distance) {
-+                Speed = 3.6 * (ride.distance - c2LastRide.distance) / (ride.seconds - c2LastRide.seconds);
-+            } else if (ride.seconds < c2LastRide.seconds || ride.distance < c2LastRide.distance) {
++            c2SpeedSample = keep::Ride{};
++        } else if (ride.hasDistance && ride.hasSeconds) {
++            if (!c2SpeedSample.hasSeconds || ride.seconds < c2SpeedSample.seconds ||
++                ride.distance < c2SpeedSample.distance) {
 +                Speed = 0;
++                c2SpeedSample = ride;
++            } else if (ride.seconds > c2SpeedSample.seconds) {
++                // Keep one distance baseline per reported second at faster poll rates.
++                Speed = 3.6 * (ride.distance - c2SpeedSample.distance) / (ride.seconds - c2SpeedSample.seconds);
++                c2SpeedSample = ride;
 +            }
 +        }
 +        if (ride.resistance > 0 && ride.resistance <= max_resistance) {
@@ -730,11 +793,18 @@ index 2464b62..7da4dda 100644
 +        c2LastRide = ride;
 +        c2LastRx = c2Clock.elapsed();
 +        c2HasData = true;
++        if (c2PollReplyDeadline && c2LastRx < c2PollReplyDeadline) {
++            c2PollReplyDeadline = 0;
++            c2PollTimeouts = 0;
++            // Queue the next send after this notification finishes processing.
++            c2PollTimer.start(int(qMax<qint64>(0, c2NextSend - c2LastRx)));
++        }
 +    }
 +}
 +
 +void keepbike::resetC2LiteMetrics() {
 +    c2LastRide = keep::Ride{};
++    c2SpeedSample = keep::Ride{};
 +    Cadence = 0;
 +    m_watt = 0;
 +    Speed = 0;
@@ -743,7 +813,7 @@ index 2464b62..7da4dda 100644
  void keepbike::btinit() {
      uint8_t initData1[] = {0x01, 0x4b, 0xf6, 0x00, 0x2e, 0x35, 0x36, 0x64, 0x61, 0x34,
                             0x32, 0x61, 0x64, 0x64, 0x30, 0x36, 0x63, 0x39, 0x39, 0x38};
-@@ -694,9 +1049,18 @@ void keepbike::stateChanged(QLowEnergyService::ServiceState state) {
+@@ -694,9 +1090,18 @@ void keepbike::stateChanged(QLowEnergyService::ServiceState state) {
  
          gattWriteCharacteristic = gattCommunicationChannelService->characteristic(_gattWriteCharacteristicId);
          gattNotifyCharacteristic = gattCommunicationChannelService->characteristic(_gattNotifyCharacteristicId);
@@ -763,7 +833,7 @@ index 2464b62..7da4dda 100644
          Q_ASSERT(gattNotifyCharacteristic.isValid());
  
          // establish hook into notifications
-@@ -755,6 +1119,10 @@ void keepbike::stateChanged(QLowEnergyService::ServiceState state) {
+@@ -755,6 +1160,10 @@ void keepbike::stateChanged(QLowEnergyService::ServiceState state) {
  }
  
  void keepbike::descriptorWritten(const QLowEnergyDescriptor &descriptor, const QByteArray &newValue) {
@@ -774,7 +844,7 @@ index 2464b62..7da4dda 100644
      qDebug() << QStringLiteral("descriptorWritten ") + descriptor.name() + QStringLiteral(" ") + newValue.toHex(' ');
  
      initRequest = true;
-@@ -762,6 +1130,10 @@ void keepbike::descriptorWritten(const QLowEnergyDescriptor &descriptor, const Q
+@@ -762,6 +1171,10 @@ void keepbike::descriptorWritten(const QLowEnergyDescriptor &descriptor, const Q
  }
  
  void keepbike::characteristicWritten(const QLowEnergyCharacteristic &characteristic, const QByteArray &newValue) {
@@ -785,7 +855,7 @@ index 2464b62..7da4dda 100644
      Q_UNUSED(characteristic);
      qDebug() << QStringLiteral("characteristicWritten ") + newValue.toHex(' ');
  }
-@@ -772,11 +1144,22 @@ void keepbike::serviceScanDone(void) {
+@@ -772,11 +1185,22 @@ void keepbike::serviceScanDone(void) {
      QBluetoothUuid _gattCommunicationChannelServiceId((quint16)0x00ff);
  
      gattCommunicationChannelService = m_control->createServiceObject(_gattCommunicationChannelServiceId);
@@ -808,23 +878,27 @@ index 2464b62..7da4dda 100644
      QMetaEnum metaEnum = QMetaEnum::fromType<QLowEnergyService::ServiceError>();
      qDebug() << QStringLiteral("keepbike::errorService") + QString::fromLocal8Bit(metaEnum.valueToKey(err)) +
                      m_control->errorString();
-@@ -793,6 +1176,10 @@ void keepbike::deviceDiscovered(const QBluetoothDeviceInfo &device) {
+@@ -793,6 +1217,13 @@ void keepbike::deviceDiscovered(const QBluetoothDeviceInfo &device) {
                      device.address().toString() + ')';
      {
          bluetoothDevice = device;
 +        c2Lite = isC2LiteName(device.name());
 +        if (c2Lite) {
 +            refresh->setInterval(100);
++            c2PollTimer.setSingleShot(true);
++            c2PollTimer.setTimerType(Qt::PreciseTimer);
++            connect(&c2PollTimer, &QTimer::timeout, this, &keepbike::update, Qt::UniqueConnection);
 +        }
  
          m_control = QLowEnergyController::createCentral(bluetoothDevice, this);
          connect(m_control, &QLowEnergyController::serviceDiscovered, this, &keepbike::serviceDiscovered);
-@@ -847,6 +1234,14 @@ void keepbike::controllerStateChanged(QLowEnergyController::ControllerState stat
+@@ -847,6 +1278,15 @@ void keepbike::controllerStateChanged(QLowEnergyController::ControllerState stat
          lastResistanceBeforeDisconnection = Resistance.value();
          qDebug() << QStringLiteral("trying to connect back again...");
          initDone = false;
 +        if (c2Lite) {
 +            initRequest = false;
++            c2PollTimer.stop();
 +            c2Handshake.clear();
 +            c2ResistanceTarget = -1;
 +            requestResistance = -1;
@@ -835,7 +909,7 @@ index 2464b62..7da4dda 100644
      }
  }
 diff --git a/src/devices/keepbike/keepbike.h b/src/devices/keepbike/keepbike.h
-index 53051ea..6ee2a66 100644
+index 53051ea..eb284ea 100644
 --- a/src/devices/keepbike/keepbike.h
 +++ b/src/devices/keepbike/keepbike.h
 @@ -23,10 +23,12 @@
@@ -868,12 +942,13 @@ index 53051ea..6ee2a66 100644
      bool connected() override;
  
    private:
-@@ -67,6 +70,35 @@ class keepbike : public bike {
+@@ -67,6 +70,41 @@ class keepbike : public bike {
      QTime GetElapsedFromPacket(const QByteArray &packet);
      void btinit();
      void btinitNewProtocol();
 +    void initC2Lite();
 +    void updateC2Lite();
++    void sendC2Lite(qint64 now);
 +    void writeC2Lite(const QByteArray &frame);
 +    void readC2Lite(const QByteArray &data);
 +    void resetC2LiteMetrics();
@@ -884,8 +959,13 @@ index 53051ea..6ee2a66 100644
 +    keep::Profile c2Profile = keep::Profile::Bridge;
 +    keep::Receiver c2Receiver;
 +    keep::Ride c2LastRide;
++    keep::Ride c2SpeedSample;
 +    QList<QByteArray> c2Handshake;
 +    QElapsedTimer c2Clock;
++    QTimer c2PollTimer;
++    qint64 c2PollSentAt = 0;
++    qint64 c2PollReplyDeadline = 0;
++    unsigned c2PollTimeouts = 0;
 +    qint64 c2NextSend = 0;
 +    qint64 c2LastRx = 0;
 +    unsigned c2Notifies = 0;
@@ -924,3 +1004,28 @@ index 2a906b2..173d8c4 100644
  devices/kingsmithr1protreadmill/kingsmithr1protreadmill.h \
  devices/kingsmithr2treadmill/kingsmithr2treadmill.h \
  devices/m3ibike/m3ibike.h \
+diff --git a/src/virtualdevices/virtualbike.cpp b/src/virtualdevices/virtualbike.cpp
+index adb4b52..d4dc37a 100644
+--- a/src/virtualdevices/virtualbike.cpp
++++ b/src/virtualdevices/virtualbike.cpp
+@@ -2,6 +2,7 @@
+ #include "devices/bike.h"
+ #include "devices/echelonconnectsport/echelonconnectsport.h"
+ #include "devices/ftmsbike/ftmsbike.h"
++#include "devices/keepbike/keepbike.h"
+ #include <QThread>
+ #include <QDataStream>
+ #include <QMetaEnum>
+@@ -757,9 +758,11 @@ virtualbike::virtualbike(bluetoothdevice *t, bool noWriteResistance, bool noHear
+ 
+     //! [Provide Heartbeat]
+     QObject::connect(&bikeTimer, &QTimer::timeout, this, &virtualbike::bikeProvider);
++    const bool fastKeep = keepbike::isC2LiteName(Bike->bluetoothDevice.name());
++    if (fastKeep) bikeTimer.setTimerType(Qt::PreciseTimer);
+     if (virtual_device_tacx)
+         bikeTimer.start(250ms);
+-    else if (settings.value(QZSettings::race_mode, QZSettings::default_race_mode).toBool() || zwift_play_emulator)
++    else if (fastKeep || settings.value(QZSettings::race_mode, QZSettings::default_race_mode).toBool() || zwift_play_emulator)
+         bikeTimer.start(50ms);
+     else
+         bikeTimer.start(1s);
